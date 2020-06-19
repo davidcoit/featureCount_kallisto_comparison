@@ -1,0 +1,398 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+
+library(data.table)
+library(dplyr)
+library(biomaRt)
+library(stringi)
+library(ggplot2)
+library(gridExtra)
+library(ggpmisc)
+# set mart to use for annotations
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+```
+
+```{r}
+# function to convert transcript ids (version) to gene id (version)
+# kallisto has several transcript ids per gene id, they need combining for fC compare
+tid2gid <- function(dt, mart){
+  # setup mart for linking tx ids to gene ids
+  # convert "targetids" to from tx ids to gene ids
+  # rename "targetid" to Geneid for later merging
+  dt$Geneid <- getBM(attributes = c('ensembl_transcript_id_version',
+                                    'ensembl_gene_id_version'),
+                     filters = 'ensembl_transcript_id_version',
+                     values = dt$target_id,
+                     mart = mart)$ensembl_gene_id_version
+  
+  # combine all transcript ids that share a gene id, sum counts
+  dt <- dt %>% 
+    group_by(Geneid) %>%
+    summarize(est_counts = sum(est_counts))
+  
+  return(dt)
+}
+
+
+
+# combine kallisto and featureCounts data for given file paths
+kfc_combine <- function(k_path, fc_path, mart){
+  # read in dataframes
+  fc  <-  fread(fc_path)
+  k  <-  fread(k_path)
+  
+  # convert kallisto count column from tx id to geneid using above function
+  k <- tid2gid(k, mart)
+  
+  # change column names
+  colnames(fc) <- c("Geneid", "Chr", "Start", "End", "Strand", "Length", "fc_counts")
+  colnames(k) <- c("Geneid", "k_counts")
+
+  # join on shared gene ids
+  combined = inner_join(k, fc, by = "Geneid")
+  combined = combined[complete.cases(combined), ]
+  return(combined)
+}
+```
+
+
+```{r}
+
+# import featureCount and kallisto output downloaded from BP to local machine
+
+lt34_fc_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT34_featureCounts.txt"
+lt34_k_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT34_kallisto_abundance.tsv"
+
+lt35_fc_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT35_featureCounts.txt"
+lt35_k_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT35_kallisto_abundance.tsv"
+
+lt36_fc_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT36_featureCounts.txt"
+lt36_k_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT36_kallisto_abundance.tsv"
+
+lt46_fc_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT46_featureCounts.txt"
+lt46_k_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT46_kallisto_abundance.tsv"
+
+lt47_fc_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT47_featureCounts.txt"
+lt47_k_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT47_kallisto_abundance.tsv"
+
+lt48_fc_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT48_featureCounts.txt"
+lt48_k_file = "/Users/USER/Documents/NYU/ASI/HW_04/output/LT48_kallisto_abundance.tsv"
+
+# combine data for runs with above function
+lt_34 = kfc_combine(lt34_k_file, lt34_fc_file, mart=mart)
+lt_35 = kfc_combine(lt35_k_file, lt35_fc_file, mart=mart)
+lt_36 = kfc_combine(lt36_k_file, lt36_fc_file, mart=mart)
+lt_46 = kfc_combine(lt46_k_file, lt46_fc_file, mart=mart)
+lt_47 = kfc_combine(lt47_k_file, lt47_fc_file, mart=mart)
+lt_48 = kfc_combine(lt48_k_file, lt48_fc_file, mart=mart)
+
+
+```
+
+
+```{r}
+
+
+## Below is not strictly part of the assignment, but an effort to filter out
+## the cases where there were extreme differences in the counts.
+## There is a "regime" of high correlation that is hard to read through the noise
+## of these extreme mismatches, this was one approach to "denoising" the data
+
+# find the smallest maximum value of counts across all datasets
+leastmax = min(min(max(lt_34$fc_counts), max(lt_34$k_counts)), 
+               min(max(lt_35$fc_counts), max(lt_35$k_counts)),
+               min(max(lt_36$fc_counts), max(lt_36$k_counts)),
+               min(max(lt_46$fc_counts), max(lt_46$k_counts)),
+               min(max(lt_47$fc_counts), max(lt_47$k_counts)),
+               min(max(lt_48$fc_counts), max(lt_48$k_counts))
+)
+
+# compile info on method comparisons where both methods have at least i observances
+# columns are values
+# rows (i) are minimum number of observations in both sets
+
+comparison_df = data.frame(minshare = double(length=leastmax),
+                           kfcr_34 = double(length=leastmax), 
+                           kfcr_35 = double(length=leastmax), 
+                           kfcr_36 = double(length=leastmax), 
+                           kfcr_46 = double(length=leastmax),
+                           kfcr_47 = double(length=leastmax),
+                           kfcr_48 = double(length=leastmax),
+                           n_34 = double(length=leastmax),
+                           n_35 = double(length=leastmax),
+                           n_36 = double(length=leastmax),
+                           n_46 = double(length=leastmax),
+                           n_47 = double(length=leastmax),
+                           n_48 = double(length=leastmax),
+                           stringsAsFactors = FALSE)
+
+# copy data frames for use in while loop
+df34 <- lt_34
+df35 <- lt_35
+df36 <- lt_36
+df46 <- lt_46
+df47 <- lt_47
+df48 <- lt_48
+ 
+# iterate over dataframe filterings, 
+# keeping only counts where there are at least i counts in both sets 
+i = 0
+while(i < leastmax){
+  
+  round(summary(lm(df34$k_counts ~ df34$fc_counts))$r.squared, 4)
+  
+  df34 <- filter(df34, k_counts > i, fc_counts > i) 
+  if(nrow(df34) > 4){
+    comparison_df[i, "kfcr_34"] <- cor.test(df34$k_counts, df34$fc_counts, method = "pearson")
+  }
+  comparison_df[i, "n_34"] <- nrow(df34)
+  
+  df35 <- filter(df35, k_counts > i, fc_counts > i) 
+  if(nrow(df35) > 4){
+    comparison_df[i, "kfcr_35"] <- cor.test(df35$k_counts, df35$fc_counts, method = "pearson")
+  }
+  comparison_df[i, "n_35"] <- nrow(df35)
+  
+  df36 <- filter(df36, k_counts > i, fc_counts > i) 
+  if(nrow(df36) > 4){
+    comparison_df[i, "kfcr_36"] <- cor.test(df36$k_counts, df36$fc_counts, method = "pearson")
+  }
+  comparison_df[i, "n_36"] <- nrow(df36)  
+  
+  df46 <- filter(df46, k_counts > i, fc_counts > i) 
+  if(nrow(df46) > 4){
+    comparison_df[i, "kfcr_46"] <- cor.test(df46$k_counts, df46$fc_counts, method = "pearson")
+  }
+  comparison_df[i, "n_46"] <- nrow(df46)
+  
+  df47 <- filter(df47, k_counts > i, fc_counts > i) 
+  if(nrow(df47) > 4){
+    comparison_df[i, "kfcr_47"] <- cor.test(df47$k_counts, df47$fc_counts, method = "pearson")
+  }
+  comparison_df[i, "n_47"] <- nrow(df47)
+  
+  df48 <- filter(df48, k_counts > i, fc_counts > i) 
+  if(nrow(df48) > 4){
+    comparison_df[i, "kfcr_48"] <- cor.test(df48$k_counts, df48$fc_counts, method = "pearson")
+  }
+  comparison_df[i, "n_48"] <- nrow(df48)
+  
+  comparison_df[i, "minshare"] <- i
+  i = i+1  
+
+}
+
+
+```
+
+
+
+
+```{r}
+
+# color generating function
+# modified from https://stackoverflow.com/questions/8197559/emulate-ggplot2-default-color-palette
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+colors = gg_color_hue(6)
+
+# set colors
+c34 = colors[1]
+c35 = colors[2]
+c36 = colors[3]
+c46 = colors[4]
+c47 = colors[5]
+c48 = colors[6]
+
+
+
+```
+
+
+
+
+
+```{r}
+
+## See how the value for correlation we get changes as we set minimum counts per read
+## As the minimum increases, we should lose those data points with extreme mismatches
+
+# plot correlation vs. min shared counts
+
+ggplot(data = comparison_df) +
+  geom_line(aes(x = (minshare), y=kfcr_34), col = c34) +
+  geom_line(aes(x = (minshare), y=kfcr_35), col = c35) +
+  geom_line(aes(x = (minshare), y=kfcr_36), col = c36) +
+  geom_line(aes(x = (minshare), y=kfcr_46), col = c46) +
+  geom_line(aes(x = (minshare), y=kfcr_47), col = c47) +
+  geom_line(aes(x = (minshare), y=kfcr_48), col = c48) +
+  xlim(1, max(comparison_df$minshare))
+  
+
+
+```
+
+
+
+
+
+```{r}
+
+#Plot individual fc vs. kallisto results
+# Set up all the individual plots and then put them all in one figure
+
+#LT34
+dataset=34
+corr34 = round(summary(lm(lt_34$k_counts ~ lt_34$fc_counts))$r.squared, 4)
+p34 <- ggplot(data = lt_34) +
+  geom_point(aes(x = fc_counts, y=k_counts),
+             size = 0.75,
+            col = c34) +
+  geom_text(label = paste0("R-squared = ", corr34),
+            x = 0.75*max(lt_34$fc_counts),
+            y = 0.75*max(lt_34$k_counts),
+            size = 3) +
+  xlab("featureCount Counts") +
+  ylab("Kallisto Counts") +
+  labs(title="Kallisto vs. featureCounts ", 
+       subtitle= paste0("Dataset: LT", dataset)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+#p34
+
+```
+
+
+```{r}
+#LT35
+dataset=35
+corr35 = round(summary(lm(lt_35$k_counts ~ lt_35$fc_counts))$r.squared, 4)
+p35 <- ggplot(data = lt_35) +
+  geom_point(aes(x = fc_counts, y=k_counts),
+             size = 0.75,
+            col = c35) +
+  geom_text(label = paste0("R-squared = ", corr35),
+            x = 0.75*max(lt_35$fc_counts),
+            y = 0.75*max(lt_35$k_counts),
+            size=3) +
+  xlab("featureCount Counts") +
+  ylab("Kallisto Counts") +
+  labs(title="Kallisto vs. featureCounts ", 
+       subtitle= paste0("Dataset: LT", dataset)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+#p35
+
+```
+
+
+
+```{r}
+#LT36
+dataset=36
+corr36 = round(summary(lm(lt_36$k_counts ~ lt_36$fc_counts))$r.squared, 4)
+p36 <- ggplot(data = lt_36) +
+  geom_point(aes(x = fc_counts, y=k_counts),
+             size = 0.75,
+            col = c36) +
+  geom_text(label = paste0("R-squared = ", corr36),
+            x = 0.75*max(lt_36$fc_counts),
+            y = 0.75*max(lt_36$k_counts),
+            size=3) +
+  xlab("featureCount Counts") +
+  ylab("Kallisto Counts") +
+  labs(title="Kallisto vs. featureCounts ", 
+       subtitle= paste0("Dataset: LT", dataset)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+#p36
+```
+
+```{r}
+#LT46
+dataset=46
+corr46 = round(summary(lm(lt_46$k_counts ~ lt_46$fc_counts))$r.squared, 4)
+p46 <- ggplot(data = lt_46) +
+  geom_point(aes(x = fc_counts, y=k_counts),
+             size = 0.75,
+            col = c46) +
+  geom_text(label = paste0("R-squared = ", corr46),
+            x = 0.75*max(lt_46$fc_counts),
+            y = 0.75*max(lt_46$k_counts),
+            size=3) +
+  xlab("featureCount Counts") +
+  ylab("Kallisto Counts") +
+  labs(title="Kallisto vs. featureCounts ", 
+       subtitle= paste0("Dataset: LT", dataset)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+#p46
+
+```
+
+
+```{r}
+#LT47
+dataset=47
+corr47 = round(summary(lm(lt_47$k_counts ~ lt_47$fc_counts))$r.squared, 4)
+p47 <- ggplot(data = lt_47) +
+  geom_point(aes(x = fc_counts, y=k_counts),
+             size = 0.75,
+            col = c47) +
+  geom_text(label = paste0("R-squared = ", corr47),
+            x = 0.75*max(lt_47$fc_counts),
+            y = 0.75*max(lt_47$k_counts),
+            size=3) +
+  xlab("featureCount Counts") +
+  ylab("Kallisto Counts") +
+  labs(title="Kallisto vs. featureCounts ", 
+       subtitle= paste0("Dataset: LT", dataset)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+#p47
+```
+
+
+```{r}
+#LT48
+
+dataset=48
+corr48 = round(summary(lm(lt_48$k_counts ~ lt_48$fc_counts))$r.squared, 4)
+p48 <- ggplot(data = lt_48) +
+  geom_point(aes(x = fc_counts, y=k_counts),
+             size = 0.75,
+            col = c48) +
+  geom_text(label = paste0("R-squared = ", corr48),
+            x = 0.75*max(lt_48$fc_counts),
+            y = 0.75*max(lt_48$k_counts),
+            size=3) +
+  xlab("featureCount Counts") +
+  ylab("Kallisto Counts") +
+  labs(title="Kallisto vs. featureCounts ", 
+       subtitle= paste0("Dataset: LT", dataset)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+#p48
+
+```
+
+
+```{r}
+# Plot all scatterplots together
+grid.arrange(p34, p35, p36, p46, p47, p48,
+             nrow = 2)
+
+```
+
+
+
+
+
